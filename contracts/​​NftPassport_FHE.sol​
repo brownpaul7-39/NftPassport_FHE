@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import { FHE, euint32, ebool } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+
+contract NftPassport_FHE is SepoliaConfig, ERC721 {
+    struct EncryptedIdentity {
+        uint256 tokenId;
+        address owner;
+        euint32 encryptedNameHash;
+        euint32 encryptedDob;
+        euint32 encryptedNationality;
+        euint32 encryptedDocumentHash;
+        uint256 mintTime;
+    }
+
+    struct DecryptedIdentity {
+        string name;
+        string dob;
+        string nationality;
+        string documentHash;
+        bool isRevealed;
+    }
+
+    uint256 private _tokenIdCounter;
+    mapping(uint256 => EncryptedIdentity) private _encryptedIdentities;
+    mapping(uint256 => DecryptedIdentity) private _decryptedIdentities;
+    mapping(uint256 => uint256) private _requestToTokenId;
+
+    event IdentityMinted(uint256 indexed tokenId, address indexed owner);
+    event VerificationRequested(uint256 indexed tokenId);
+    event IdentityVerified(uint256 indexed tokenId);
+
+    constructor() ERC721("FHE Identity Passport", "FHE-ID") {}
+
+    function mintEncryptedIdentity(
+        euint32 nameHash,
+        euint32 dob,
+        euint32 nationality,
+        euint32 documentHash
+    ) public {
+        uint256 tokenId = _tokenIdCounter++;
+        _mint(msg.sender, tokenId);
+
+        _encryptedIdentities[tokenId] = EncryptedIdentity({
+            tokenId: tokenId,
+            owner: msg.sender,
+            encryptedNameHash: nameHash,
+            encryptedDob: dob,
+            encryptedNationality: nationality,
+            encryptedDocumentHash: documentHash,
+            mintTime: block.timestamp
+        });
+
+        _decryptedIdentities[tokenId] = DecryptedIdentity({
+            name: "",
+            dob: "",
+            nationality: "",
+            documentHash: "",
+            isRevealed: false
+        });
+
+        emit IdentityMinted(tokenId, msg.sender);
+    }
+
+    function requestIdentityVerification(uint256 tokenId) public {
+        require(ownerOf(tokenId) == msg.sender, "Not token owner");
+        require(!_decryptedIdentities[tokenId].isRevealed, "Already revealed");
+
+        EncryptedIdentity storage identity = _encryptedIdentities[tokenId];
+        
+        bytes32[] memory ciphertexts = new bytes32[](4);
+        ciphertexts[0] = FHE.toBytes32(identity.encryptedNameHash);
+        ciphertexts[1] = FHE.toBytes32(identity.encryptedDob);
+        ciphertexts[2] = FHE.toBytes32(identity.encryptedNationality);
+        ciphertexts[3] = FHE.toBytes32(identity.encryptedDocumentHash);
+
+        uint256 reqId = FHE.requestDecryption(ciphertexts, this.verifyIdentity.selector);
+        _requestToTokenId[reqId] = tokenId;
+
+        emit VerificationRequested(tokenId);
+    }
+
+    function verifyIdentity(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory proof
+    ) public {
+        uint256 tokenId = _requestToTokenId[requestId];
+        require(tokenId != 0, "Invalid request");
+
+        DecryptedIdentity storage identity = _decryptedIdentities[tokenId];
+        require(!identity.isRevealed, "Already revealed");
+
+        FHE.checkSignatures(requestId, cleartexts, proof);
+
+        string[] memory results = abi.decode(cleartexts, (string[]));
+        
+        identity.name = results[0];
+        identity.dob = results[1];
+        identity.nationality = results[2];
+        identity.documentHash = results[3];
+        identity.isRevealed = true;
+
+        emit IdentityVerified(tokenId);
+    }
+
+    function getDecryptedIdentity(uint256 tokenId) public view returns (
+        string memory name,
+        string memory dob,
+        string memory nationality,
+        string memory documentHash,
+        bool isRevealed
+    ) {
+        require(ownerOf(tokenId) == msg.sender, "Not token owner");
+        DecryptedIdentity storage identity = _decryptedIdentities[tokenId];
+        return (
+            identity.name,
+            identity.dob,
+            identity.nationality,
+            identity.documentHash,
+            identity.isRevealed
+        );
+    }
+
+    function verifyEncryptedAttribute(
+        euint32 encryptedAttribute,
+        euint32 expectedValue
+    ) public pure returns (ebool) {
+        return FHE.eq(encryptedAttribute, expectedValue);
+    }
+
+    function calculateEncryptedScore(
+        euint32[] memory attributes
+    ) public pure returns (euint32) {
+        require(attributes.length > 0, "Empty attributes");
+        
+        euint32 total = attributes[0];
+        for (uint i = 1; i < attributes.length; i++) {
+            total = FHE.add(total, attributes[i]);
+        }
+        return FHE.div(total, FHE.asEuint32(uint32(attributes.length)));
+    }
+
+    function getMintTime(uint256 tokenId) public view returns (uint256) {
+        return _encryptedIdentities[tokenId].mintTime;
+    }
+
+    function _beforeTokenTransfer(
+        address from,
+        address to,
+        uint256 tokenId,
+        uint256 batchSize
+    ) internal override {
+        require(from == address(0) || to == address(0), "Soulbound token");
+        super._beforeTokenTransfer(from, to, tokenId, batchSize);
+    }
+}
